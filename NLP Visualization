@@ -1,0 +1,312 @@
+import pandas as pd, numpy as np, os, matplotlib.pyplot as plt
+import datetime as dt
+from textblob import TextBlob
+from collections import Counter
+import time
+import spacy
+import nltk
+nltk.download('stopwords') #download stopwords from NLTK servers
+from nltk.corpus import stopwords # import them
+sw = stopwords.words('english')
+
+! pip install pyldavis
+
+import pandas as pd, numpy as np, matplotlib.pyplot as plt, os, time # standard imports
+from itertools import chain
+# for sentiment analysis
+from textblob import TextBlob
+# for doing text processing and LDA
+import spacy
+from gensim.models.ldamulticore import LdaMulticore # this is the multi-core version
+from gensim import corpora # import the corpora module
+from gensim.models import Phrases
+from gensim.models.word2vec import LineSentence
+from sklearn.model_selection import train_test_split
+
+# For LDA visualization
+import pyLDAvis
+import pyLDAvis.sklearn
+pyLDAvis.enable_notebook()
+import pyLDAvis
+import pyLDAvis.gensim_models as gensimvis
+pyLDAvis.enable_notebook()
+
+from google.colab import drive
+import os, glob
+from pydoc import describe
+import pandas as pd
+
+drive.mount('drive')
+import os, pandas as pd, numpy as np, matplotlib.pyplot as plt
+nlppath  = '/content/drive/MyDrive/NLPCars/'
+os.listdir(nlppath)
+
+path = '/content/drive/MyDrive/Cars/'
+
+all_files = glob.glob(os.path.join(path, "*.csv"))
+
+all_df = []
+for f in all_files:
+    df = pd.read_csv(f,engine='python' ,sep=',')
+    df['Make'] = f.split('/')[-1]
+    all_df.append(df)
+    
+merged_df = pd.concat(all_df, ignore_index=True, sort=True)
+merged_df.to_csv("mergedreviews.csv")
+
+df = pd.read_csv('mergedreviews.csv')
+df = pd.DataFrame(df)
+df = df.drop(["Unnamed: 0","Unnamed: 0.1"],axis=1)
+df['Rating'].replace('', np.nan, inplace=True)
+df.dropna(subset=['Rating'], inplace=True)
+df.reset_index()
+df.head(20)
+
+df.groupby('Make').nunique().reset_index()
+
+numeros = list(np.sort(df['Rating'].unique()))
+numeros
+
+#First lets do some visualization to get a better understanding on how the data looks
+dfplot = plt.hist(df['Rating'])
+df['polarity'] = df['Review'].apply(lambda x: TextBlob(x).sentiment.polarity)
+df['subjectivity'] = df['Review'].apply(lambda x: TextBlob(x).sentiment.subjectivity)
+df.polarity.hist() 
+plt.axvline(x= 0, color = 'black', linewidth = 1)
+plt.title('Distribution of Polarity')
+df[['Rating', 'polarity','subjectivity']].corr()
+df.groupby('Make')['Rating', 'polarity','subjectivity'].corr()
+
+def line_doc(filename, encode = 'utf-8'):
+    """
+    generator function to read in reviews from the file
+    and un-escape the original line breaks in the text
+    """
+    with open(filename, 'r', encoding = encode) as f:
+        for txt in f:
+            # yield returns next line
+            yield txt.replace('\\n', '\n')
+            # and get rid of any line breaks
+
+# parsing to be done per sentence
+def lemmatize(s, exclude):
+    return [w.lemma_.lower() for w in s if (w.lemma_ not in exclude)&(~w.is_punct)]
+
+
+# next will be a function that will pass a filename to the line_doc function
+# and generate the parsed versions of ***EVERY SENTENCE***
+# this function streams a file at filename and yields one parsed sentence at a time
+def lemmatize_sentence_corpus(filename,nlp, batch_size, sw=[], exclusions=[], encode = 'utf-8'):
+    nlp.disable_pipes(["ner"]) # disable ner and tagger makes it a little faster
+    # batch_size is the number of documents to parse in memory at a time
+    # n_threads it the number of parallel (simultaneous processes to run)
+    # n_threads is limited by the number of virtual cpu's on the system
+    # the default free Colab system has only 2 virtual cores
+    # most modern computers have at least 4
+    exclude = set(sw + exclusions)
+    for parsed_txt in nlp.pipe(line_doc(filename, encode = encode),batch_size=batch_size):
+            for sent in parsed_txt.sents:
+                yield ' '.join(lemmatize(sent, exclude))
+
+
+def write_parsed_sentence_corpus(readfile, writefile, nlp, batch_size, sw=[], exclusions =[], encode = 'utf-8'):
+    streamingfile = lemmatize_sentence_corpus(readfile,nlp, batch_size, sw=sw, exclusions=exclusions, encode = encode)
+    with open(writefile, 'w', encoding = encode) as f:
+        for sentence in streamingfile:
+            if len(sentence)>0: # write sentence if includes non stopwords
+                f.write(sentence+'\n')
+    print('Success')
+
+
+def phrase_detection(parsedfile, folderpath, passes = 2, returnmodels = True,threshold=10., encode = 'utf-8'):
+    """
+    parsedfile is the file location and name of the parsed sentence file
+    folderpath is where the models and phrase detected texts need to be stored
+
+    This function does phrase modeling. User specifies the number of passes.
+    Each additional pass detects longer phrases. The maximum detectable phrase length for
+    each pass, n, is 2^n.
+    Returns the list of models by default. Also saves models and intermediary
+    phrased sentences for each pass.
+    """
+    ngram = list()
+    for it in range(passes):
+        gen = LineSentence(parsedfile)
+        gram=Phrases(gen, threshold = threshold)
+        ngram.append(gram)
+        modelpath = folderpath+'phrase_model_{}.phrasemodel'.format(it+1)
+        textpath = folderpath+'sent_gram_{}.txt'.format(it+1)
+        gram.save(modelpath)
+        # Write sentence n-gram
+        with open(textpath, 'w', encoding=encode) as f:
+            for sent in gen:
+                new_sent = ' '.join(gram[sent])
+                f.write(new_sent + '\n')
+
+    if returnmodels == True:
+        return ngram
+
+
+def phrase_prediction(rawfilepath, outpath,nlp, grams, sw =[], exclusions = [], batch_size = 500, encode = 'utf-8'):
+    """
+    rawfilepath is where the raw reviews (where 1 line = 1 review) are saved 
+    outpath is where to save the resulting parsed and phrase modeled reviews
+    nlp is the spacy parser object
+    grams is a list of phrasemodels 
+    sw is a list of stopwords
+    exclusions are additional words to exclude
+
+    """
+    with open(outpath, 'w', encoding = encode) as f:
+        
+        nlp.disable_pipes(["ner"]) # disable ner and tagger makes it a little faster
+        exclude = set(sw + exclusions)
+        
+        for parsed_txt in nlp.pipe(line_doc(rawfilepath, encode = encode),batch_size=batch_size):
+            doc = list()
+            for sent in parsed_txt.sents:
+                parsed = lemmatize(sent, exclude)
+                for gram in grams: # loop through phrase models
+                    parsed = gram[parsed] # apply phrase model transformation to sentence
+                doc.append(' '.join(parsed).strip()) # append resulting phrase modeled sentence to list "doc"
+            # write the transformed review as a single line in the new file
+            txt_gram = ' '.join(doc).strip() # join all sentences in doc together as txt_gram
+            f.write(txt_gram + '\n') # write the entire phrase modeled and parsed doc as one line in file
+
+from google.colab import drive
+drive.mount('drive')
+import os, pandas as pd, numpy as np, matplotlib.pyplot as plt
+fpath = '/content/drive/MyDrive/Cars/'
+os.listdir(fpath)
+
+texts = '\n'.join(list(df.Review.apply(lambda x: x.replace('\n', ' ').replace('\r', ' '))))
+with open(nlppath + 'rawtexts.txt', 'w', encoding = 'utf-8') as f:
+    f.write(texts)
+    
+#Lets check if this works! We should be getting one review
+lines = line_doc(nlppath + 'rawtexts.txt')
+next(lines)
+
+
+sw = stopwords.words('english')
+nlp = spacy.load('en_core_web_sm')
+t0 = time.time() # used for timing the step
+# to parse the text
+write_parsed_sentence_corpus(nlppath +'rawtexts.txt', nlppath +'parsedtexts.txt', nlp, batch_size=1000, sw=sw, exclusions = ['-PRON-'])
+
+# calculate and print time to run
+td = time.time()-t0 
+print('Took {:.2f} minutes'.format(td/60))
+
+t0 = time.time()
+ngrams = phrase_detection(nlppath + 'parsedtexts.txt', nlppath) # this line detects phrases
+# and returns a list of phrase models which we are calling "ngrams"
+td = time.time()-t0
+print('Took {:.2f} minutes'.format(td/60))
+
+sw = stopwords.words('english') # reload the stopwords
+nlp = spacy.load('en_core_web_sm') # reload the spacy nlp parser
+
+t0 = time.time()
+phrase_prediction(nlppath+'rawtexts.txt', nlppath+'parsedreviews.txt', nlp, ngrams, sw,exclusions= ['-PRON-'], batch_size = 1000)
+td = time.time()-t0
+print('Took {:.2f} minutes'.format(td/60))
+
+with open(nlppath + 'parsedreviews.txt', 'r', encoding = 'utf-8') as f:
+    reviews = f.readlines()
+ 
+#This should match!
+len(df), len(reviews)
+
+df['parsed'] = reviews
+df['parsed'] = df['parsed'].str.strip()
+
+# get list of list of parsed words 
+reviews = list(df.parsed.str.strip().str.split()) 
+# above line
+# takes the parsed review strings, strips extra spaces at beginning and end
+# split the parsed review strings on spaces to create list of words
+
+# make dictionary
+# 1==1 then create dictionary, 1==0 then read in saved dictionary
+if 1==1:
+    dictionary = corpora.Dictionary(reviews) # creates the dictionary
+    dictionary.save(nlppath + 'dictionary.dict') # saves dictionary to the disk
+else:
+    # if crashed
+    dictionary = corpora.Dictionary.load(nlppath + 'dictionary.dict')
+
+# filter extremes
+# use some intuition here / play around with the bounds
+# no_below: if fewer than this many documents contains a word, it is not used in dictionary
+# no_above: if a word appears in more than this proportion of documents, then don't use it in dictionary
+# Be conscious of what 1 document means
+# In this example 1 document = 1 review
+# here are 10's of thousands of reviews, so a word not appearing at least 25 is likely a name or misspelling
+# Each review is not very long, so if a word appears in 20% of reviews, it is likely uninformative
+# If each document is very long, then we probably don't want to filter out any frequent words
+# because most words will belong to every document
+dictionary.filter_extremes(no_below=25, no_above=0.2)
+
+# create a bag of words corpus from parsed reviews in list of list format
+corpus = [dictionary.doc2bow(r) for r in reviews]
+
+if 1==1:
+    t0 = time.time()
+    perplexity = list()
+
+    # define a training and testing set
+    corpus_train, corpus_test = train_test_split(corpus, test_size = .1)
+
+    # loop through different total number of topics
+    for numtopics in range(10, 70, 10): # look at at 5-25 in increments of 10
+
+        lda = LdaMulticore(corpus_train, id2word=dictionary, num_topics=numtopics) # Run LDA
+        lda.save(nlppath+'lda{}.lda'.format(numtopics)) # save the model so we can load it up again later w/o running the model
+        
+        p = lda.log_perplexity(corpus_test) # compute the perplexity on testing set
+        
+        # append numtopics & p, to the perplexity list 
+        perplexity.append([numtopics, p])
+        
+        # print out number of topics to display progress
+        print(numtopics)
+    
+    # Plot perplexity 
+    temp = pd.DataFrame(perplexity, columns = ['ntopics', 'perplexity'])
+    plt.plot(temp.ntopics, temp.perplexity)
+    td = time.time()-t0
+    print('Took {:.2f} minutes'.format(td/60))
+    
+#Lets Run some LDA!
+numtopics = 50 #50 is the best number!
+lda = LdaMulticore.load(nlppath + 'lda{}.lda'.format(numtopics))  
+
+lda.minimum_probability = 0
+df['topic_probs'] = df.parsed.str.strip().str.split().apply(lambda x: dict(lda[dictionary.doc2bow(x)]))
+
+for top in range(numtopics):
+    df['top_{}'.format(top)] = df.topic_probs.apply(lambda x: x.get(top))
+
+lda_viz = gensimvis.prepare(lda, corpus, dictionary)
+pyLDAvis.save_html(lda_viz, nlppath + 'viz_{}.html'.format(numtopics)) 
+
+#Here comes the big moment! You should see an LDA diagram
+lda_viz
+
+#Most common words per rating
+pdc_by_star = df.groupby('Rating')['parsed'].apply(lambda x: ' '.join(list(x))).str.split().reset_index()
+pdc_by_star
+
+
+pdc_by_star.sort_values(by = 5.000, ascending = False).head(5)
+pdc_by_star[5.000].sort_values(ascending = False).head(5)
+fivestar = pd.DataFrame(pdc_by_star[5.000].sort_values(ascending = False).head(5))
+fivestar.columns = ['Top Topics for 5 Rating']
+fivestar
+
+pdc_by_star.sort_values(by = 1, ascending = False).head(5)
+pdc_by_star[1.000].sort_values(ascending = False).head(5)
+onestar = pd.DataFrame(pdc_by_star[1.000].sort_values(ascending = False).head(5))
+onestar.columns = ['Top Topics for 1 Rating']
+onestar
